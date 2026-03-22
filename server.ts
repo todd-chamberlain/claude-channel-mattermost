@@ -436,6 +436,11 @@ function safeName(s: string | undefined): string | undefined {
 // Track the most recent inbound chat so permission prompts go to the right place
 let lastActiveChatId: string | null = null
 
+// Pending permission requests — maps display number to request_id
+// Most recent request is always at the highest number
+let pendingPermissions: { num: number; requestId: string }[] = []
+let nextPermNum = 1
+
 const mcp = new Server(
   { name: 'mattermost', version: '1.0.0' },
   {
@@ -492,11 +497,20 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
     process.stderr.write('mattermost channel: permission request but no active chat\n')
     return
   }
+  const num = nextPermNum++
+  pendingPermissions.push({ num, requestId: params.request_id })
+  // Keep only the last 20 to prevent unbounded growth
+  if (pendingPermissions.length > 20) pendingPermissions = pendingPermissions.slice(-20)
+
   const preview = params.input_preview.length > 500
     ? params.input_preview.slice(0, 500) + '…'
     : params.input_preview
+  const hasMultiple = pendingPermissions.length > 1
+  const hint = hasMultiple
+    ? `Reply **yes** / **no** (for #${num}), or **yes ${num}** / **no ${num}**`
+    : `Reply **yes** or **no**`
   const msg = [
-    `**Permission Request** — Claude wants to run **${params.tool_name}**:`,
+    `**#${num} — Allow ${params.tool_name}?**`,
     '',
     `> ${params.description}`,
     '',
@@ -504,7 +518,7 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
     preview,
     '```',
     '',
-    `Reply \`yes ${params.request_id}\` or \`no ${params.request_id}\``,
+    hint,
   ].join('\n')
   try {
     await mmApi('POST', '/posts', { channel_id: chatId, message: msg })
@@ -903,21 +917,54 @@ async function handlePostedEvent(
   const username = await getUsername(userId)
 
   // Check for permission verdict before forwarding as chat
-  // Matches: "y abcde", "yes abcde", "n abcde", "no abcde"
-  // [a-km-z] is the ID alphabet Claude Code uses (lowercase, skips 'l')
-  const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
-  const verdictMatch = PERMISSION_REPLY_RE.exec(message)
-  if (verdictMatch) {
+  // Supports:
+  //   "yes" / "no" / "y" / "n"         → most recent pending request
+  //   "yes 3" / "no 3" / "y 3" / "n 3" → specific request by number
+  //   "yes abcde" / "no abcde"          → raw request_id (fallback)
+  const trimmed = message.trim().toLowerCase()
+  const VERDICT_SIMPLE_RE = /^(y|yes|n|no)$/
+  const VERDICT_NUM_RE = /^(y|yes|n|no)\s+(\d+)$/
+  const VERDICT_RAW_RE = /^(y|yes|n|no)\s+([a-km-z]{5})$/
+
+  let verdictAllow: boolean | null = null
+  let verdictRequestId: string | null = null
+
+  const simpleMatch = VERDICT_SIMPLE_RE.exec(trimmed)
+  const numMatch = VERDICT_NUM_RE.exec(trimmed)
+  const rawMatch = VERDICT_RAW_RE.exec(trimmed)
+
+  if (simpleMatch && pendingPermissions.length > 0) {
+    // Bare "yes"/"no" → most recent pending
+    verdictAllow = simpleMatch[1].startsWith('y')
+    const entry = pendingPermissions[pendingPermissions.length - 1]
+    verdictRequestId = entry.requestId
+    pendingPermissions = pendingPermissions.filter(p => p.requestId !== verdictRequestId)
+  } else if (numMatch) {
+    // "yes 3" / "no 3" → by display number
+    verdictAllow = numMatch[1].startsWith('y')
+    const num = parseInt(numMatch[2], 10)
+    const entry = pendingPermissions.find(p => p.num === num)
+    if (entry) {
+      verdictRequestId = entry.requestId
+      pendingPermissions = pendingPermissions.filter(p => p.requestId !== verdictRequestId)
+    }
+  } else if (rawMatch) {
+    // "yes abcde" → raw request_id (backward compat)
+    verdictAllow = rawMatch[1].startsWith('y')
+    verdictRequestId = rawMatch[2]
+    pendingPermissions = pendingPermissions.filter(p => p.requestId !== verdictRequestId)
+  }
+
+  if (verdictRequestId !== null && verdictAllow !== null) {
     await mcp.notification({
       method: 'notifications/claude/channel/permission' as any,
       params: {
-        request_id: verdictMatch[2].toLowerCase(),
-        behavior: verdictMatch[1].toLowerCase().startsWith('y') ? 'allow' : 'deny',
+        request_id: verdictRequestId,
+        behavior: verdictAllow ? 'allow' : 'deny',
       },
     })
-    // Ack the verdict with a reaction
     if (postId) {
-      const emoji = verdictMatch[1].toLowerCase().startsWith('y') ? 'white_check_mark' : 'no_entry_sign'
+      const emoji = verdictAllow ? 'white_check_mark' : 'no_entry_sign'
       void mmApi('POST', '/reactions', {
         user_id: botUserId,
         post_id: postId,
