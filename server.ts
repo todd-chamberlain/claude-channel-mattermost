@@ -106,6 +106,7 @@ function defaultAccess(): Access {
 
 const MAX_CHUNK_LIMIT = 16383 // Mattermost default MaxPostSize
 const DEFAULT_CHUNK_LIMIT = 4000 // conservative default
+const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024 // 50MB — Mattermost default MaxFileSize
 
 // ── File safety ──────────────────────────────────────────────────────────────
 
@@ -620,8 +621,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         for (const f of files) {
           assertSendable(f)
           const st = statSync(f)
-          if (st.size > 100 * 1024 * 1024) {
-            throw new Error(`file too large: ${f} (${(st.size / 1024 / 1024).toFixed(1)}MB)`)
+          if (st.size > MAX_ATTACHMENT_BYTES) {
+            throw new Error(`file too large: ${f} (${(st.size / 1024 / 1024).toFixed(1)}MB, limit ${MAX_ATTACHMENT_BYTES / 1024 / 1024}MB)`)
           }
         }
 
@@ -726,7 +727,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           const ts = new Date(post.create_at).toISOString()
           const attCount = post.file_ids?.length ?? 0
           const attSuffix = attCount > 0 ? ` +${attCount}att` : ''
-          lines.push(`[${ts}] ${username} (${post.id}): ${post.message}${attSuffix}`)
+          // Sanitize newlines to prevent fake history entries (prompt injection)
+          const sanitized = (post.message ?? '').replace(/[\r\n]+/g, ' \u23CE ')
+          lines.push(`[${ts}] ${username} (${post.id}): ${sanitized}${attSuffix}`)
         }
         return { content: [{ type: 'text', text: lines.join('\n') || '(no messages)' }] }
       }
@@ -759,9 +762,9 @@ function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
   process.stderr.write('mattermost channel: shutting down\n')
-  setTimeout(() => process.exit(0), 2000)
   try { ws?.close() } catch {}
-  process.exit(0)
+  // Give the WebSocket close a moment, then exit
+  setTimeout(() => process.exit(0), 500)
 }
 process.stdin.on('end', shutdown)
 process.stdin.on('close', shutdown)
@@ -780,7 +783,7 @@ async function getChannelType(channelId: string): Promise<string> {
     channelTypeCache.set(channelId, ch.type)
     return ch.type
   } catch {
-    return 'O' // default to public channel
+    return '' // unknown — gate will drop (safe default)
   }
 }
 
@@ -863,7 +866,8 @@ async function connectWebSocket(): Promise<void> {
         // Ignore bot's own messages
         if (post.user_id === botUserId) return
 
-        void handlePostedEvent(post, postData)
+        void handlePostedEvent(post, postData).catch(err =>
+          process.stderr.write(`mattermost channel: handlePostedEvent failed: ${err}\n`))
       }
     }
 
@@ -933,13 +937,13 @@ async function handlePostedEvent(
   const numMatch = VERDICT_NUM_RE.exec(trimmed)
   const rawMatch = VERDICT_RAW_RE.exec(trimmed)
 
-  if (simpleMatch && pendingPermissions.length > 0) {
-    // Bare "yes"/"no" → most recent pending
+  if (simpleMatch && pendingPermissions.length > 0 && channelId === lastActiveChatId) {
+    // Bare "yes"/"no" → most recent pending (only in the active chat)
     verdictAllow = simpleMatch[1].startsWith('y')
     const entry = pendingPermissions[pendingPermissions.length - 1]
     verdictRequestId = entry.requestId
     pendingPermissions = pendingPermissions.filter(p => p.requestId !== verdictRequestId)
-  } else if (numMatch) {
+  } else if (numMatch && channelId === lastActiveChatId) {
     // "yes 3" / "no 3" → by display number
     verdictAllow = numMatch[1].startsWith('y')
     const num = parseInt(numMatch[2], 10)
