@@ -272,15 +272,30 @@ async function getOrCreateDmChannel(userId: string): Promise<string> {
 
 // ── Outbound gate ────────────────────────────────────────────────────────────
 
-function assertAllowedChat(chatId: string): void {
+async function assertAllowedChat(chatId: string): Promise<void> {
   const access = loadAccess()
   // Check if it's an opted-in group channel
   if (chatId in access.groups) return
-  // Check if it's a DM channel with an allowlisted user
+  // Check if it's a DM channel with an allowlisted user (cached)
   const userId = dmChannelReverse.get(chatId)
   if (userId && access.allowFrom.includes(userId)) return
   // Also check if chatId itself is a user ID in allowFrom (for direct API usage)
   if (access.allowFrom.includes(chatId)) return
+  // Cache miss — fetch channel info to check if it's a DM with an allowlisted user.
+  // This handles the case where outbound replies happen before an inbound message
+  // populates the dmChannelReverse map (e.g. first use, or MCP-only mode).
+  try {
+    const ch = await mmApi('GET', `/channels/${chatId}`) as { type: string; name: string }
+    if (ch.type === 'D') {
+      // DM channel names are the two user IDs joined with "__"
+      const parts = ch.name.split('__')
+      const otherUserId = parts.find(id => id !== botUserId)
+      if (otherUserId) {
+        registerDmChannel(otherUserId, chatId)
+        if (access.allowFrom.includes(otherUserId)) return
+      }
+    }
+  } catch {}
   throw new Error(`chat ${chatId} is not allowlisted — add via /mattermost:access`)
 }
 
@@ -625,7 +640,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const replyTo = args.reply_to as string | undefined
         const files = (args.files as string[] | undefined) ?? []
 
-        assertAllowedChat(chatId)
+        await assertAllowedChat(chatId)
 
         for (const f of files) {
           assertSendable(f)
@@ -681,7 +696,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
 
       case 'react': {
-        assertAllowedChat(args.chat_id as string)
+        await assertAllowedChat(args.chat_id as string)
         await mmApi('POST', '/reactions', {
           user_id: botUserId,
           post_id: args.message_id as string,
@@ -697,7 +712,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           name: string; size: number; mime_type: string; channel_id?: string
         }
         // Gate: verify file belongs to an allowed channel
-        if (info.channel_id) assertAllowedChat(info.channel_id)
+        if (info.channel_id) await assertAllowedChat(info.channel_id)
         // Size check before downloading into memory
         if (info.size > MAX_ATTACHMENT_BYTES) {
           throw new Error(`file too large: ${info.name} (${(info.size / 1024 / 1024).toFixed(1)}MB, limit ${MAX_ATTACHMENT_BYTES / 1024 / 1024}MB)`)
@@ -716,7 +731,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
 
       case 'edit_message': {
-        assertAllowedChat(args.chat_id as string)
+        await assertAllowedChat(args.chat_id as string)
         await mmApi('PUT', `/posts/${args.message_id as string}`, {
           id: args.message_id as string,
           message: args.text as string,
@@ -727,7 +742,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       case 'fetch_messages': {
         const channelId = args.channel as string
         const fetchLimit = Math.min(Math.max(Number(args.limit) || 20, 1), 100)
-        assertAllowedChat(channelId)
+        await assertAllowedChat(channelId)
         const data = await mmApi('GET', `/channels/${channelId}/posts?per_page=${fetchLimit}`) as {
           order: string[]
           posts: Record<string, { id: string; user_id: string; message: string; create_at: number; file_ids?: string[] }>
