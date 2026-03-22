@@ -108,6 +108,11 @@ const MAX_CHUNK_LIMIT = 16383 // Mattermost default MaxPostSize
 const DEFAULT_CHUNK_LIMIT = 4000 // conservative default
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024 // 50MB — Mattermost default MaxFileSize
 
+// Permission verdict patterns — hoisted for perf (compiled once, not per-message)
+const VERDICT_SIMPLE_RE = /^(y|yes|n|no)$/
+const VERDICT_NUM_RE = /^(y|yes|n|no)\s+(\d+)$/
+const VERDICT_RAW_RE = /^(y|yes|n|no)\s+([a-z0-9]{3,10})$/ // broad match for any request_id format
+
 // ── File safety ──────────────────────────────────────────────────────────────
 
 function assertSendable(f: string): void {
@@ -229,6 +234,7 @@ let botUsername = ''
 
 // ── Username cache ───────────────────────────────────────────────────────────
 
+// Bounded by the finite number of users on the Mattermost instance
 const userCache = new Map<string, string>()
 
 async function getUsername(userId: string): Promise<string> {
@@ -247,6 +253,7 @@ async function getUsername(userId: string): Promise<string> {
 // Mattermost DM channel IDs differ from user IDs. We need a mapping for
 // outbound gating and for sending pairing confirmations.
 
+// Bounded by the finite number of DM conversations (one per user)
 const dmChannelMap = new Map<string, string>() // userId -> channelId
 const dmChannelReverse = new Map<string, string>() // channelId -> userId
 
@@ -503,9 +510,11 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
   // Keep only the last 20 to prevent unbounded growth
   if (pendingPermissions.length > 20) pendingPermissions = pendingPermissions.slice(-20)
 
-  const preview = params.input_preview.length > 500
+  const rawPreview = params.input_preview.length > 500
     ? params.input_preview.slice(0, 500) + '…'
     : params.input_preview
+  // Escape triple backticks to prevent breaking out of the code fence
+  const preview = rawPreview.replace(/```/g, '` ` `')
   const hasMultiple = pendingPermissions.length > 1
   const hint = hasMultiple
     ? `Reply **yes** / **no** (for #${num}), or **yes ${num}** / **no ${num}**`
@@ -683,9 +692,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
       case 'download_attachment': {
         const fileId = args.file_id as string
-        // Get file info for the filename
+        // Get file info — includes channel_id for gate check and size for limit
         const info = await mmApi('GET', `/files/${fileId}/info`) as {
-          name: string; size: number; mime_type: string
+          name: string; size: number; mime_type: string; channel_id?: string
+        }
+        // Gate: verify file belongs to an allowed channel
+        if (info.channel_id) assertAllowedChat(info.channel_id)
+        // Size check before downloading into memory
+        if (info.size > MAX_ATTACHMENT_BYTES) {
+          throw new Error(`file too large: ${info.name} (${(info.size / 1024 / 1024).toFixed(1)}MB, limit ${MAX_ATTACHMENT_BYTES / 1024 / 1024}MB)`)
         }
         // Download file content
         const res = await fetch(`${MM_URL}/api/v4/files/${fileId}`, {
@@ -773,6 +788,7 @@ process.on('SIGINT', shutdown)
 
 // ── Channel type cache ───────────────────────────────────────────────────────
 
+// Bounded by the finite number of channels on the Mattermost instance
 const channelTypeCache = new Map<string, string>()
 
 async function getChannelType(channelId: string): Promise<string> {
@@ -926,9 +942,7 @@ async function handlePostedEvent(
   //   "yes 3" / "no 3" / "y 3" / "n 3" → specific request by number
   //   "yes abcde" / "no abcde"          → raw request_id (fallback)
   const trimmed = message.trim().toLowerCase()
-  const VERDICT_SIMPLE_RE = /^(y|yes|n|no)$/
-  const VERDICT_NUM_RE = /^(y|yes|n|no)\s+(\d+)$/
-  const VERDICT_RAW_RE = /^(y|yes|n|no)\s+([a-km-z]{5})$/
+  // Verdict regexes are module-level constants (lines 112-114)
 
   let verdictAllow: boolean | null = null
   let verdictRequestId: string | null = null
