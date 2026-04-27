@@ -981,8 +981,10 @@ async function handlePostedEvent(
       verdictRequestId = entry.requestId
       pendingPermissions = pendingPermissions.filter(p => p.requestId !== verdictRequestId)
     }
-  } else if (rawMatch) {
-    // "yes abcde" → raw request_id (backward compat)
+  } else if (rawMatch && channelId === lastActiveChatId) {
+    // "yes abcde" → raw request_id (backward compat).
+    // Active-chat check matches the simple/numbered branches above so a
+    // verdict can only come from the chat that received the prompt.
     verdictAllow = rawMatch[1].startsWith('y')
     verdictRequestId = rawMatch[2]
     pendingPermissions = pendingPermissions.filter(p => p.requestId !== verdictRequestId)
